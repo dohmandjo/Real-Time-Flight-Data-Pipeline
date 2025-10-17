@@ -1,59 +1,59 @@
+# Use Compose v2+ (Docker Desktop / docker compose). This file defines the whole stack.
+
 services:
-  postgres:
+  postgres:                       # --- PostgreSQL OLAP/warehouse database
     image: postgres:16
     container_name: flight_postgres
-    env_file: .env
+    env_file: .env               # Load DB creds and names from .env so they’re not hard-coded
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    ports: ["5432:5432"]
-    healthcheck:
+    ports: ["5432:5432"]         # Expose DB to host for dev/testing (psql, DBeaver, etc.)
+    healthcheck:                 # Wait until Postgres is ready before dependents start
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 20
     volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./db/00_warehouse.sql:/docker-entrypoint-initdb.d/00_warehouse.sql:ro
-      - ./db/01_views.sql:/docker-entrypoint-initdb.d/01_views.sql:ro
+      - pgdata:/var/lib/postgresql/data      # Persistent DB data volume
+      - ./db/00_warehouse.sql:/docker-entrypoint-initdb.d/00_warehouse.sql:ro  # Bootstrap schema
+      - ./db/01_views.sql:/docker-entrypoint-initdb.d/01_views.sql:ro          # Create helper views
 
-  kafka:
+  kafka:                         # --- Single-broker Kafka (KRaft mode) for streaming
     image: bitnami/kafka:3.7
     container_name: flight_kafka
     environment:
-      - KAFKA_ENABLE_KRAFT=yes
+      - KAFKA_ENABLE_KRAFT=yes                              # Use KRaft
       - KAFKA_CFG_NODE_ID=1
       - KAFKA_CFG_PROCESS_ROLES=broker,controller
       - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
       - KAFKA_CFG_LISTENERS=PLAINTEXT://:9094,CONTROLLER://:9093
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9094
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9094 # How other containers reach the broker
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
       - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
-      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1         # Single broker → RF=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
-      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
-      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true             # Let the producer auto-create topic (dev)
+      - ALLOW_PLAINTEXT_LISTENER=yes                         # Simple plaintext for local dev
     ports:
-      - "${HOST_KAFKA_PORT:-9094}:9094"
-    healthcheck:
+      - "${HOST_KAFKA_PORT:-9094}:9094"                      # Expose to host; overridable
+    healthcheck:                                             # Consider broker live when CLI can list
       test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9094 --list >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
       start_period: 20s
 
-  producer:
+  producer:                     # --- Python app: polls Aviationstack API → produces to Kafka
     build: ./apps/producer
-    env_file: .env
+    env_file: .env             # Needs AVIATIONSTACK_KEY, KAFKA_BOOTSTRAP, KAFKA_TOPIC
     depends_on: 
-      kafka: {condition: service_healthy}
+      kafka: {condition: service_healthy}    # Start only after Kafka is ready
     restart: unless-stopped
 
-# ✂️ remove spark-master, spark-worker-1, and old spark-app
-
-  spark:
+  spark:                        # --- Spark Structured Streaming consumer/transformer → Postgres
     build: ./apps/spark_app
     container_name: flight_spark
     depends_on: 
@@ -61,29 +61,27 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    env_file: .env
+    env_file: .env             # Reads PG + Kafka + checkpoint env
     environment:
-      # Make sure these exist in your .env (or inline here)
-      - KAFKA_BOOTSTRAP=kafka:9094          # ← your KRaft broker inside Compose
-      - KAFKA_TOPIC=${KAFKA_TOPIC}          # flights_live
-      - PGHOST=${PGHOST}                    # flight_postgres
-      - PGPORT=${PGPORT}                    # 5432
-      - PGDATABASE=${PGDATABASE}            # flight_pipeline
-      - PGUSER=${PGUSER}                    # flight_user
-      - PGPASSWORD=${PGPASSWORD}            # Password123
+      - KAFKA_BOOTSTRAP=kafka:9094                 # Broker address inside the Compose network
+      - KAFKA_TOPIC=${KAFKA_TOPIC}                 # Topic to subscribe to (e.g., flight_live)
+      - PGHOST=${PGHOST}
+      - PGPORT=${PGPORT}
+      - PGDATABASE=${PGDATABASE}
+      - PGUSER=${PGUSER}      
+      - PGPASSWORD=${PGPASSWORD}
       - CHECKPOINT_DIR=${CHECKPOINT_DIR:-/tmp/chk/flights_stream}
-    # Use ARRAY form so args are not split by the shell
-    command:
+    command:                                       # Run the Spark job
       - /opt/bitnami/spark/bin/spark-submit
       - --master
       - local[*]
       - --conf
       - spark.jars.ivy=/opt/bitnami/spark/app/ivy
       - --packages
-      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6,org.postgresql:postgresql:42.7.3   # <— 3.5.6
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6,org.postgresql:postgresql:42.7.3
       - /opt/bitnami/spark/app/flight_stream.py
     volumes:
-      - spark_ivy:/opt/bitnami/spark/app/ivy 
+      - spark_ivy:/opt/bitnami/spark/app/ivy
     restart: unless-stopped
 
   loader:
@@ -96,7 +94,7 @@ services:
     command: ["python", "load_warehouse.py", "--interval-seconds", "60"]
     restart: unless-stopped
   
-  sheets-sink:
+  sheets-sink:                  # --- Trickler: pushes curated fact rows → Google Sheets
     build: ./apps/sheets_sink
     container_name: flight_gsheet
     depends_on: 
@@ -104,20 +102,20 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/gsa-keys.json   # <-- fix
-      - GSHEET_ID=${GSHEET_ID}
-      - GSHEET_TAB=${GSHEET_TAB}
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/gsa-keys.json     # Path inside container
+      - GSHEET_ID=${GSHEET_ID}                                    # Target spreadsheet
+      - GSHEET_TAB=${GSHEET_TAB}                                  # Target worksheet/tab
       - PGHOST=${PGHOST}
       - PGPORT=${PGPORT}
       - PGDATABASE=${PGDATABASE}
       - PGUSER=${PGUSER}
       - PGPASSWORD=${PGPASSWORD}
-      - GSHEET_BATCH_SIZE=${GSHEET_BATCH_SIZE:-300}
-      - GSHEET_INTERVAL_SEC=${GSHEET_INTERVAL_SEC:-30}
+      - GSHEET_BATCH_SIZE=${GSHEET_BATCH_SIZE:-300}               # Rows per append
+      - GSHEET_INTERVAL_SEC=${GSHEET_INTERVAL_SEC:-30}            # Idle poll interval
     volumes:
-      -  "${HOME}/gsa/gsa-keys.json:/secrets/gsa-keys.json:ro"
+      -  "${HOME}/gsa/gsa-keys.json:/secrets/gsa-keys.json:ro"    # Bind SA key from host
     restart: unless-stopped
 
 volumes:
-  pgdata:
-  spark_ivy:
+  pgdata:        # Named volume for Postgres data files
+  spark_ivy:     # Named volume for Spark Ivy (downloaded jars)

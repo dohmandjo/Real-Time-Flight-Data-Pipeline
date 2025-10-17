@@ -1,7 +1,22 @@
 # apps/loader/load_warehouse.py
+# -----------------------------------------------------------------------------
+# Purpose
+#   Batch loader that:
+#     1) Upserts airlines and airports into dimensions (IATA-first, ICAO-fallback)
+#     2) Builds routes (dep/arr airport pairs) with a unique constraint
+#     3) Upserts the latest flight snapshot into the fact table (by flight_key)
+#     4) Deletes processed rows from staging (watermark = single server cutoff)
+#
+# Notes
+#   - Uses DISTINCT ON to pick the freshest record per natural key.
+#   - Avoids ON CONFLICT on nullable columns by splitting IATA/ICAO paths.
+#   - Retries Postgres connection to survive container startup races.
+# -----------------------------------------------------------------------------
+
 import os, time, argparse, psycopg
 from datetime import datetime
 
+# Build DSN from env (with a connection timeout so retries are fast)
 PG_DSN = (
     f"host={os.getenv('PGHOST','flight_postgres')} "
     f"port={os.getenv('PGPORT','5432')} "
@@ -11,7 +26,9 @@ PG_DSN = (
     f"connect_timeout={os.getenv('PGCONNECT_TIMEOUT','5')}"
 )
 
-# ---------------- AIRLINE (IATA first) ----------------
+# ---------------- AIRLINE (IATA first) ----------------------------------------
+# Insert/Upsert airlines where IATA exists. We prefer IATA as the unique key.
+# DISTINCT ON chooses the newest (by ingest_time DESC) record per airline_iata.
 STMT_AIRLINE_IATA = """
 WITH src AS (
   SELECT DISTINCT ON (airline_iata)
@@ -31,7 +48,11 @@ SET icao         = COALESCE(EXCLUDED.icao, dim_airline.icao),
     airline_name = COALESCE(EXCLUDED.airline_name, dim_airline.airline_name);
 """
 
-# ---------------- AIRLINE (ICAO-only path; no ON CONFLICT) ----------------
+# ---------------- AIRLINE (ICAO-only path; no ON CONFLICT) --------------------
+# Some carriers may not have IATA. Because dim_airline.iata is UNIQUE (nullable),
+# we *cannot* ON CONFLICT (iata) where iata is NULL. So we:
+#   1) UPDATE by ICAO if it already exists,
+#   2) INSERT a new row (iata=NULL, icao=<value>) if not present.
 STMT_AIRLINE_ICAO_ONLY = """
 WITH src AS (
   SELECT DISTINCT ON (airline_icao)
@@ -57,7 +78,8 @@ WHERE NOT EXISTS (
 );
 """
 
-# ---------------- AIRPORTS (IATA first) ----------------
+# ---------------- AIRPORTS (IATA first) ---------------------------------------
+# Same pattern for airports: prefer IATA where available (unique key).
 STMT_AIRPORT_DEP_IATA = """
 WITH src AS (
   SELECT DISTINCT ON (dep_airport_iata)
@@ -96,7 +118,9 @@ SET icao         = COALESCE(EXCLUDED.icao, dim_airport.icao),
     airport_name = COALESCE(EXCLUDED.airport_name, dim_airport.airport_name);
 """
 
-# ---------------- AIRPORTS (ICAO fallback; no ON CONFLICT) ----------------
+# ---------------- AIRPORTS (ICAO fallback; no ON CONFLICT) --------------------
+# When IATA is absent but ICAO exists, we update/insert by ICAO similarly
+# to the airline ICAO-only path (because iata is nullable unique).
 STMT_AIRPORT_DEP_ICAO = """
 WITH src AS (
   SELECT DISTINCT ON (dep_airport_icao)
@@ -155,7 +179,9 @@ WHERE NOT EXISTS (
 );
 """
 
-# ---------------- ROUTES ----------------
+# ---------------- ROUTES ------------------------------------------------------
+# Build route pairs from the resolved airport dimension IDs (dep/arr).
+# Unique constraint uq_route(dep_airport_id, arr_airport_id) handles dedupe.
 STMT_ROUTES = """
 WITH pairs AS (
   SELECT DISTINCT
@@ -176,7 +202,9 @@ FROM pairs
 ON CONFLICT (dep_airport_id, arr_airport_id) DO NOTHING;
 """
 
-# ---------------- FACTS (latest per flight_key) ----------------
+# ---------------- FACTS (latest per flight_key) -------------------------------
+# Upsert the *latest* snapshot per flight_key into the fact table.
+# Use COALESCE on IDs to avoid wiping enriched keys with NULLs on update.
 STMT_FACT = """
 WITH latest AS (
   SELECT DISTINCT ON (flight_key) *
@@ -249,16 +277,20 @@ SET flight_date   = EXCLUDED.flight_date,
     last_updated  = NOW();
 """
 
+# Delete processed rows from staging (anything <= cutoff time)
 STMT_DELETE_STAGING = "DELETE FROM fact_flight_status_staging WHERE ingest_time <= %s;"
 
 def connect_with_retry(max_attempts: int = 40, base_delay: float = 1.0):
-    """Try to connect to Postgres with exponential backoff."""
+    """
+    Attempt to connect to Postgres with exponential backoff.
+    This survives the common container race where Postgres isn't ready yet.
+    """
     attempt = 0
     while True:
         attempt += 1
         try:
             conn = psycopg.connect(PG_DSN, autocommit=False)
-            # sanity check that the server is ready
+            # Quick sanity query ensures the server is actually accepting work
             with conn.cursor() as cur:
                 cur.execute("SELECT 1;")
                 cur.fetchone()
@@ -274,12 +306,19 @@ def connect_with_retry(max_attempts: int = 40, base_delay: float = 1.0):
             time.sleep(sleep_for)
 
 def run_once():
+    """
+    Single load cycle:
+      - take a single cutoff timestamp from DB (consistent watermark)
+      - run all dimension + route + fact load steps using that cutoff
+      - delete consumed rows from staging
+    """
     with connect_with_retry() as conn:
         with conn.cursor() as cur:
-            # single server-side cutoff
+            # One server-side cutoff to make all statements consistent
             cur.execute("SELECT now();")
             (cutoff,) = cur.fetchone()
 
+            # Execute each statement with the same cutoff (in order)
             for stmt in (
                 STMT_AIRLINE_IATA, STMT_AIRLINE_ICAO_ONLY,
                 STMT_AIRPORT_DEP_IATA, STMT_AIRPORT_ARR_IATA,
@@ -290,6 +329,7 @@ def run_once():
         conn.commit()
 
 if __name__ == "__main__":
+    # Interval driver: run once if <= 0, else loop with sleep
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval-seconds", type=int, default=60)
     interval = ap.parse_args().interval_seconds
@@ -301,6 +341,6 @@ if __name__ == "__main__":
             try:
                 run_once()
             except Exception as e:
-                # don't kill the container; log and try again next tick
+                # Keep the container alive; log and try again on next interval
                 print(f"[loader] run_once failed: {e}", flush=True)
             time.sleep(interval)
