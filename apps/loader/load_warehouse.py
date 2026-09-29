@@ -13,18 +13,30 @@
 #   - Retries Postgres connection to survive container startup races.
 # -----------------------------------------------------------------------------
 
-import os, time, argparse, psycopg
-from datetime import datetime
+import argparse
+import os
+import time
 
-# Build DSN from env (with a connection timeout so retries are fast)
-PG_DSN = (
-    f"host={os.getenv('PGHOST','flight_postgres')} "
-    f"port={os.getenv('PGPORT','5432')} "
-    f"dbname={os.getenv('PGDATABASE','flight_pipeline')} "
-    f"user={os.getenv('PGUSER','flight_user')} "
-    f"password={os.getenv('PGPASSWORD','Password123')} "
-    f"connect_timeout={os.getenv('PGCONNECT_TIMEOUT','5')}"
-)
+import psycopg
+
+
+def pg_dsn() -> str:
+    """Build the Postgres DSN from env at call time (a short connect timeout keeps retries fast).
+
+    Credentials come only from the environment: there is deliberately no default password.
+    """
+    password = os.getenv("PGPASSWORD")
+    if not password:
+        raise RuntimeError("PGPASSWORD is not set (copy .env.example to .env).")
+    return (
+        f"host={os.getenv('PGHOST', 'flight_postgres')} "
+        f"port={os.getenv('PGPORT', '5432')} "
+        f"dbname={os.getenv('PGDATABASE', 'flight_pipeline')} "
+        f"user={os.getenv('PGUSER', 'flight_user')} "
+        f"password={password} "
+        f"connect_timeout={os.getenv('PGCONNECT_TIMEOUT', '5')}"
+    )
+
 
 # ---------------- AIRLINE (IATA first) ----------------------------------------
 # Insert/Upsert airlines where IATA exists. We prefer IATA as the unique key.
@@ -280,7 +292,7 @@ SET flight_date   = EXCLUDED.flight_date,
 # Delete processed rows from staging (anything <= cutoff time)
 STMT_DELETE_STAGING = "DELETE FROM fact_flight_status_staging WHERE ingest_time <= %s;"
 
-def connect_with_retry(max_attempts: int = 40, base_delay: float = 1.0):
+def connect_with_retry(dsn: str | None = None, max_attempts: int = 40, base_delay: float = 1.0):
     """
     Attempt to connect to Postgres with exponential backoff.
     This survives the common container race where Postgres isn't ready yet.
@@ -289,7 +301,7 @@ def connect_with_retry(max_attempts: int = 40, base_delay: float = 1.0):
     while True:
         attempt += 1
         try:
-            conn = psycopg.connect(PG_DSN, autocommit=False)
+            conn = psycopg.connect(dsn or pg_dsn(), autocommit=False)
             # Quick sanity query ensures the server is actually accepting work
             with conn.cursor() as cur:
                 cur.execute("SELECT 1;")
@@ -305,14 +317,14 @@ def connect_with_retry(max_attempts: int = 40, base_delay: float = 1.0):
             print(f"[loader] Postgres unavailable (attempt {attempt}): {e}. Retrying in {sleep_for:.1f}s...", flush=True)
             time.sleep(sleep_for)
 
-def run_once():
+def run_once(dsn: str | None = None):
     """
     Single load cycle:
       - take a single cutoff timestamp from DB (consistent watermark)
       - run all dimension + route + fact load steps using that cutoff
       - delete consumed rows from staging
     """
-    with connect_with_retry() as conn:
+    with connect_with_retry(dsn) as conn:
         with conn.cursor() as cur:
             # One server-side cutoff to make all statements consistent
             cur.execute("SELECT now();")
