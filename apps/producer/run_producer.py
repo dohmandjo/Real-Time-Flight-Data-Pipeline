@@ -6,7 +6,8 @@ Requirements
 - Environment variables:
     AVIATIONSTACK_KEY  : your Aviationstack API key
     KAFKA_BOOTSTRAP    : Kafka bootstrap servers (default "kafka:9094" in Compose network)
-    KAFKA_TOPIC        : Kafka topic to produce to (default "flights_live")
+    KAFKA_TOPIC        : Kafka topic to produce to (default "flight_live"; must match the Spark job)
+    AVIATIONSTACK_URL  : API endpoint (default: the plain-HTTP free-tier URL)
 
 - Network assumptions:
     This script runs inside Docker Compose where the Kafka broker is reachable as "kafka:9094".
@@ -24,15 +25,23 @@ Notes
   to act as a stable dedup key downstream.
 """
 
-import os, time, json, argparse, requests
+import argparse
+import json
+import os
+import time
 from datetime import datetime, timezone
+
+import requests
 from dateutil import parser as dtp
 from kafka import KafkaProducer
 
 # --- Configuration via env vars (with safe defaults for local dev/Compose) ---
-API_KEY = os.getenv("AVIATIONSTACK_KEY")                            # Required for API access
+API_KEY = os.getenv("AVIATIONSTACK_KEY")                            # Required for API access (checked in main)
+API_URL = os.getenv("AVIATIONSTACK_URL", "http://api.aviationstack.com/v1/flights")  # free tier is HTTP-only
 BROKER  = os.getenv("KAFKA_BOOTSTRAP", "kafka:9094")                # Kafka broker(s) inside Compose
-TOPIC   = os.getenv("KAFKA_TOPIC", "flights_live")                  # Target Kafka topic
+TOPIC   = os.getenv("KAFKA_TOPIC", "flight_live")                   # Target Kafka topic (same default as Spark)
+
+MAX_BACKOFF_SECONDS = 300                                            # cap for retry sleeps after API failures
 
 def build_record(rec):
     """
@@ -124,14 +133,25 @@ def fetch_batch():
     """
     Pull a single page of flights from the Aviationstack API.
     - Keep 'limit' modest to respect free/low-tier API quotas.
-    - Any HTTP error raises; caller may retry on next loop.
+    - Raises on HTTP errors *and* on Aviationstack's in-band errors (HTTP 200 with an
+      {"error": {...}} body, e.g. invalid key or exhausted quota), which would otherwise
+      look like an empty result.
     """
-    url = "http://api.aviationstack.com/v1/flights"
     params = {"access_key": API_KEY, "limit": 100}
-    r = requests.get(url, params=params, timeout=30)
+    r = requests.get(API_URL, params=params, timeout=30)
     r.raise_for_status()
+    payload = r.json()
+    if isinstance(payload, dict) and payload.get("error"):
+        err = payload["error"]
+        raise RuntimeError(f"Aviationstack error {err.get('code')}: {err.get('message')}")
     # API returns: {"pagination": {...}, "data": [ ... ] }
-    return r.json().get("data", [])
+    return payload.get("data", [])
+
+
+def backoff_seconds(failures: int, base: int) -> int:
+    """Exponential backoff (base * 2^(failures-1)) capped at MAX_BACKOFF_SECONDS."""
+    return min(base * 2 ** max(failures - 1, 0), MAX_BACKOFF_SECONDS)
+
 
 def main(interval):
     """
@@ -139,23 +159,43 @@ def main(interval):
       - Create a Kafka producer.
       - In an endless loop:
           fetch a batch → transform each record → send to Kafka → flush → sleep.
+      - API failures are logged and retried with exponential backoff instead of
+        crashing the container.
     """
+    if not API_KEY:
+        raise SystemExit("AVIATIONSTACK_KEY is not set (see .env.example).")
+
     producer = KafkaProducer(
         bootstrap_servers=BROKER,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),  # JSON encode each message
-        linger_ms=100                                              # Small batching window
+        linger_ms=100,                                             # Small batching window
+        acks="all",                                                # wait for the broker to persist
+        retries=5,                                                 # client-side retry of failed sends
     )
 
+    failures = 0
     while True:
-        for rec in fetch_batch():
+        try:
+            records = fetch_batch()
+        except (requests.RequestException, RuntimeError, ValueError) as e:
+            failures += 1
+            delay = backoff_seconds(failures, base=interval)
+            print(f"[producer] fetch failed ({failures} in a row): {e}. Retrying in {delay}s", flush=True)
+            time.sleep(delay)
+            continue
+        failures = 0
+
+        for rec in records:
             # Transform the raw API record into the normalized schema and send it
             producer.send(TOPIC, build_record(rec))
 
         # Force any buffered messages to be sent now (flush the linger)
         producer.flush()
+        print(f"[producer] sent {len(records)} records to {TOPIC}", flush=True)
 
         # Pause before next API call to control rate and respect API quotas
         time.sleep(interval)
+
 
 if __name__ == "__main__":
     # Simple CLI to control polling interval without changing code

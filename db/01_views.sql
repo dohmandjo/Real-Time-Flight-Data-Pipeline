@@ -2,12 +2,12 @@
 -- 01_views.sql
 -- Purpose:
 --   * Create a tiny state table used as a watermark for incremental
---     syncing to Google Sheets (the sink reads only rows with
---     last_updated > last_sync_time).
+--     syncing to Google Sheets (the sink reads only rows after the
+--     (last_updated, flight_key) watermark).
 --   * Create a curated, analysis-friendly view that joins the fact table
 --     to its dimensions so Google Sheets / Tableau get tidy columns.
 -- What it does:
---   1) Ensures gsheet_sync_state exists and is initialized (id=1).
+--   1) Ensures gsheet_sync_state (keyset watermark) exists and is initialized (id=1).
 --   2) Defines vw_flights_for_sheet_fact with denormalized columns:
 --      flight identifiers/status + airline + dep/arr airport fields
 --      + key timestamps/delays + last_updated for incremental pulls.
@@ -24,8 +24,14 @@
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS gsheet_sync_state(
   id INT PRIMARY KEY DEFAULT 1,
-  last_sync_time TIMESTAMPTZ
+  last_sync_time TIMESTAMPTZ,
+  -- Tiebreaker for rows sharing the same last_updated (the loader stamps a whole cycle
+  -- with one NOW()), so the watermark is the pair (last_sync_time, last_flight_key).
+  last_flight_key TEXT NOT NULL DEFAULT ''
 );
+
+-- Upgrade path for databases created before last_flight_key existed.
+ALTER TABLE gsheet_sync_state ADD COLUMN IF NOT EXISTS last_flight_key TEXT NOT NULL DEFAULT '';
 
 -- Seed the row once; future runs won't overwrite it.
 INSERT INTO gsheet_sync_state(id, last_sync_time)

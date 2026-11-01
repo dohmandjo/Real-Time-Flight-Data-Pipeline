@@ -6,7 +6,7 @@ Component: Google Sheets Sink (Incremental Exporter)
 Purpose / What it does
 ----------------------
 - Reads *new or changed* rows from the warehouse view `vw_flights_for_sheet_fact`
-  using a high-watermark (`gsheet_sync_state.last_sync_time`).
+  using a keyset watermark (`gsheet_sync_state.last_sync_time` + `last_flight_key`).
 - Appends those rows to a specific Google Sheet tab, keeping headers intact.
 - Ensures two delay columns (dep_delay_min, arr_delay_min) are *numeric* in Sheets,
   so they aggregate properly and flow cleanly into Tableau.
@@ -22,24 +22,27 @@ How (high level)
 ----------------
 1) Bootstrap Google Sheets client (service account), ensure the tab exists.
 2) Ensure header row is present and formatted; set numeric format on delay columns.
-3) Loop:
-   - Fetch a batch of rows newer than the last sync time.
+3) `sync_once()` (called in a loop here, or by the Airflow DAG):
+   - Fetch a batch of rows after the watermark, ordered by (last_updated, flight_key).
    - Convert Python values → Sheets cells (keep delays as float, timestamps ISO8601).
    - Append below header (A2).
-   - Advance high-watermark to the newest `last_updated` sent.
-   - Sleep briefly, repeat.
+   - Advance the watermark to the last row sent, then repeat until drained.
 
 Operational Notes
 -----------------
 - Requires a Postgres table `gsheet_sync_state` with a single row id=1, storing
-  `last_sync_time` (TIMESTAMPTZ). The view `vw_flights_for_sheet_fact` must include
+  `last_sync_time` (TIMESTAMPTZ) and `last_flight_key` (TEXT). The view `vw_flights_for_sheet_fact` must include
   the exact column names listed in COLUMNS (last one is `last_updated`).
 - Uses `valueInputOption="RAW"` so numeric floats remain numbers in Sheets.
-- Idempotence: The high-watermark guarantees each row is exported once.
+- Delivery is at-least-once: the watermark moves only after a successful append, so a crash
+  between append and watermark update re-sends that batch. A flight whose row is updated again
+  by the loader is appended again (the sheet is an append-only log of updates).
 ===============================================================================
 """
 
-import os, sys, time, shutil
+import os
+import shutil
+import time
 from datetime import datetime, timezone
 from decimal import Decimal  # numeric safety for delay columns
 
@@ -47,16 +50,21 @@ import psycopg
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+
 # ---------- Config ----------
-# Postgres DSN pulled from environment (Compose passes these in).
-# `connect_timeout` can be added on demand via environment if needed.
-PG_DSN = (
-    f"host={os.getenv('PGHOST','flight_postgres')} "
-    f"port={os.getenv('PGPORT','5432')} "
-    f"dbname={os.getenv('PGDATABASE','flight_pipeline')} "
-    f"user={os.getenv('PGUSER','flight_user')} "
-    f"password={os.getenv('PGPASSWORD','Password123')}"
-)
+def pg_dsn() -> str:
+    """Build the Postgres DSN from env at call time (no default password on purpose)."""
+    password = os.getenv("PGPASSWORD")
+    if not password:
+        raise RuntimeError("PGPASSWORD is not set (copy .env.example to .env).")
+    return (
+        f"host={os.getenv('PGHOST', 'flight_postgres')} "
+        f"port={os.getenv('PGPORT', '5432')} "
+        f"dbname={os.getenv('PGDATABASE', 'flight_pipeline')} "
+        f"user={os.getenv('PGUSER', 'flight_user')} "
+        f"password={password}"
+    )
+
 
 # Google API credentials (Service Account JSON) and Sheet info
 CRED_SRC  = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/gsa-keys.json")
@@ -84,24 +92,31 @@ NUMERIC_COLS_IDX = [
     COLUMNS.index("arr_delay_min"),   # 0-based index for arr_delay_min
 ]
 
-# Query pulls only rows newer than the last exported timestamp (watermark).
+# Keyset pagination on (last_updated, flight_key).
+#
+# The loader stamps every row of one load cycle with the same last_updated (NOW() is the
+# transaction start time). A watermark on last_updated alone would therefore skip the rest
+# of a cycle whenever it holds more rows than one batch. Adding flight_key as a tiebreaker
+# makes the ordering total, so the watermark can sit in the middle of a group of equal
+# timestamps without losing rows.
 SELECT_SQL = f"""
 WITH last AS (
-  SELECT COALESCE(last_sync_time, 'epoch'::timestamptz) AS t
-  FROM gsheet_sync_state WHERE id=1
+  SELECT COALESCE(last_sync_time, 'epoch'::timestamptz) AS t,
+         COALESCE(last_flight_key, '')                  AS k
+  FROM gsheet_sync_state WHERE id = 1
 )
 SELECT {", ".join(COLUMNS)}
 FROM vw_flights_for_sheet_fact, last
-WHERE last_updated > last.t
-ORDER BY last_updated
+WHERE (last_updated, flight_key) > (last.t, last.k)
+ORDER BY last_updated, flight_key
 LIMIT %s;
 """
 
-# Bump the high-watermark to the max(last_updated) we just pushed.
+# Advance the watermark to the last row we just appended (the query guarantees it only moves forward).
 UPDATE_STATE_SQL = """
 UPDATE gsheet_sync_state
-SET last_sync_time = GREATEST(last_sync_time, %s)
-WHERE id=1;
+SET last_sync_time = %s, last_flight_key = %s
+WHERE id = 1;
 """
 
 # ---------- Helpers ----------
@@ -225,18 +240,15 @@ def set_numeric_format_for_delay_cols(svc, sheet_id: int):
 def get_sheets():
     """
     Initialize Sheets API client with service account credentials.
-    Guardrails: verify env vars and that the credentials file exists.
+    Raises RuntimeError with an actionable message if configuration is missing
+    (an exception, not sys.exit, so it also fails cleanly inside an Airflow task).
     """
     if not SHEET_ID:
-        print("[Sheets] GSHEET_ID is not set. Exiting.", flush=True)
-        sys.exit(1)
+        raise RuntimeError("GSHEET_ID is not set.")
     if not TAB:
-        print("[Sheets] GSHEET_TAB is empty after stripping. Set GSHEET_TAB.", flush=True)
-        sys.exit(1)
+        raise RuntimeError("GSHEET_TAB is empty after stripping. Set GSHEET_TAB.")
     if not os.path.isfile(CRED_SRC):
-        print(f"[Sheets] Credential file not found at {CRED_SRC}. /secrets listing:", flush=True)
-        os.system("ls -l /secrets || true")
-        sys.exit(1)
+        raise RuntimeError(f"Service-account key not found at {CRED_SRC}. Mount it into the container.")
 
     cred_path = stage_creds(CRED_SRC)
     print(f"[Sheets] Using staged credentials: {cred_path}", flush=True)
@@ -296,43 +308,73 @@ def to_values(rows):
         out.append(vals)
     return out
 
-# ---------- Main ----------
-def main():
-    print(f"[Sheets] GSHEET_ID={SHEET_ID}, TAB={TAB}, BATCH_SIZE={BATCH_SIZE}, INTERVAL={INTERVAL}", flush=True)
-
-    # 1) Sheets client and basic sheet setup
-    svc = get_sheets()
+# ---------- Sync ----------
+def setup_sheet(svc):
+    """Create the tab if needed, then (idempotently) apply the header row and number formats."""
     sheet_id = get_sheet_id(svc, SHEET_ID, TAB)
     ensure_header_and_format(svc, sheet_id)
     set_numeric_format_for_delay_cols(svc, sheet_id)  # enforce numeric display
 
-    # 2) Postgres connection; loop forever pulling and appending new rows
-    with psycopg.connect(PG_DSN, autocommit=False) as conn:
-        print("[Sheets] Connected to Postgres and state bootstrapped.", flush=True)
-        while True:
-            rows = fetch_batch(conn, BATCH_SIZE)
+
+def sync_once(svc=None, conn=None, batch_size=None, max_batches=50) -> int:
+    """
+    Append every row newer than the watermark to the sheet, batch by batch.
+
+    * The watermark advances only after a batch was appended successfully, so a failure
+      re-sends that batch on the next run (at-least-once delivery).
+    * Stops after ``max_batches`` so one run has bounded duration; the next run continues.
+
+    Returns the number of rows appended.
+    """
+    svc = svc or get_sheets()
+    batch_size = batch_size or BATCH_SIZE
+    owns_conn = conn is None
+    conn = conn or psycopg.connect(pg_dsn(), autocommit=False)
+    total = 0
+    try:
+        for _ in range(max_batches):
+            rows = fetch_batch(conn, batch_size)
             if not rows:
-                time.sleep(INTERVAL)
-                continue
+                break
 
-            values = to_values(rows)
+            append_to_sheet(svc, to_values(rows))   # raises on failure -> watermark not advanced
 
-            # Try append; if the Sheets API momentarily fails, wait and retry later
-            try:
-                append_to_sheet(svc, values)
-            except Exception as e:
-                print(f"[Sheets] Append failed: {e}", flush=True)
-                time.sleep(5)
-                continue
-
-            # Advance the watermark using the newest last_updated we appended
-            max_ts = max(r[-1] for r in rows)  # last column is last_updated
+            last_row = rows[-1]                     # ORDER BY (last_updated, flight_key) => max tuple
             with conn.cursor() as cur:
-                cur.execute(UPDATE_STATE_SQL, (max_ts,))
+                cur.execute(UPDATE_STATE_SQL, (last_row[-1], last_row[0]))
             conn.commit()
+            total += len(rows)
 
-            # Small pause between batches to avoid hammering APIs
-            time.sleep(1)
+            if len(rows) < batch_size:              # drained
+                break
+        conn.commit()                               # close the read transaction (no idle-in-transaction)
+        return total
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+# ---------- Standalone loop (used when Airflow is not orchestrating) ----------
+def main():
+    print(f"[Sheets] GSHEET_ID={SHEET_ID}, TAB={TAB}, BATCH_SIZE={BATCH_SIZE}, INTERVAL={INTERVAL}", flush=True)
+
+    svc = get_sheets()
+    setup_sheet(svc)
+
+    while True:
+        try:
+            pushed = sync_once(svc)
+        except Exception as e:  # keep the container alive; retry on the next tick
+            print(f"[Sheets] sync failed: {e}", flush=True)
+            time.sleep(5)
+            continue
+
+        if pushed:
+            print(f"[Sheets] appended {pushed} rows", flush=True)
+            time.sleep(1)            # small pause between busy cycles to avoid hammering the API
+        else:
+            time.sleep(INTERVAL)
+
 
 if __name__ == "__main__":
     main()

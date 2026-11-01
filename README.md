@@ -1,370 +1,200 @@
-# Real-Time-Flight-Data-Pipeline
+# Real-Time Flight Data Pipeline
 
-A fully containerized, streaming data pipeline that ingests live flight data from the **Aviationstack** API into **Kafka**, cleans and filters it with **Spark Structured Streaming (PySpark)**, loads it into a **Postgres** warehouse (staging + star schema), mirrors curated facts to **Google Sheets**, and visualizes everything in **Tableau Public**.
+A containerized streaming pipeline: live flight data from the **Aviationstack** API flows through **Kafka** and **Spark Structured Streaming** into a **PostgreSQL** star-schema warehouse, is orchestrated by **Apache Airflow**, mirrored to **Google Sheets**, and visualized in **Tableau Public**.
 
----
+[![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
 
 ## What you get
 
-- **Streaming ingest** from Aviationstack → **Kafka** topic (`flight_live`)
-- **PySpark** stream:
-  - Robust timestamp normalization (fixes odd seconds, timezones, millis)
-  - Filters to **arrived** or **en-route** flights only
-  - Keeps rolling **last 3 days**
-- **Postgres** warehouse:
-  - `fact_flight_status_staging` (stream landing)
-  - Dimensions: `dim_airline`, `dim_airport`, `dim_route`
-  - Fact: `fact_flight_status` with `last_updated`
-  - Curated view: `vw_flights_for_sheet_fact`
-- **Google Sheets Sink**:
-  - Incremental sync using a watermark (`gsheet_sync_state.last_sync_time`)
-  - Header row, frozen/bold, auto-size, **numeric** delay columns
-- **Tableau Public** dashboards on top of the sheet (refreshable)
+- **Streaming ingest** – a Python producer polls Aviationstack and writes JSON events to the Kafka topic `flight_live`.
+- **PySpark stream** – parses and normalizes timestamps (Z / `+0000` / missing seconds / fractions), keeps flights whose status is `active`, `landed`, `arrived`, `en-route` or `enroute` from the last 3 days, and appends them to a Postgres staging table.
+- **Postgres warehouse** – staging table, `dim_airline`, `dim_airport`, `dim_route`, the `fact_flight_status` fact table and a curated view for BI.
+- **Airflow orchestration** – two DAGs (warehouse load and Sheets sync) with 3 retries, exponential backoff, execution timeouts and no overlapping runs.
+- **Google Sheets sink** – incremental, at-least-once export with a keyset watermark; numeric delay columns.
+- **Tableau Public** dashboards on top of the sheet.
+- **Tests + CI** – unit tests (Spark transforms, producer, sheet helpers), integration tests against a real Postgres (loader SQL, view, watermark), and DAG checks.
 
----
+## Architecture
 
-## 🧱 Architecture
+```mermaid
+flowchart LR
+    API[Aviationstack API] -->|REST| P[Producer<br/>Python]
+    P --> K[(Kafka<br/>flight_live)]
+    K --> S[Spark Structured Streaming<br/>parse + normalize + filter]
+    S -->|JDBC append| STG[(Postgres<br/>staging)]
+    subgraph Airflow
+        L[warehouse_load DAG<br/>every 2 min]
+        G[sheets_sync DAG<br/>every 2 min]
+    end
+    STG --> L --> W[(Star schema<br/>dim_* + fact)]
+    W --> V[vw_flights_for_sheet_fact]
+    V --> G --> GS[Google Sheets]
+    GS --> T[Tableau Public]
+```
 
-Aviationstack API ──(REST)──> Producer (Python) ──> Kafka (topic: flight_live)
-│
-▼
-Spark Structured Streaming (PySpark)
-normalize + filter + last 3 days + write to Postgres (staging)
-│
-▼
-Loader (Python, SQL upserts) ──> Star schema in Postgres
-│
-▼
-Google Sheets Sink (incremental by last_updated watermark)
-│
-▼
-Tableau Public (analysis & dashboards)
+## Repository layout
 
----
-
-## Repo layout
-
-├─ docker-compose.yml
-├─ .env.example
-├─ apps/
-│ ├─ producer/
-│ │ ├─ run_producer.py
-│ │ └─ Dockerfile
-│ ├─ spark_app/
-│ │ ├─ flight_stream.py
-│ │ └─ Dockerfile
-│ ├─ loader/
-│ │ ├─ load_warehouse.py
-│ │ └─ Dockerfile
-│ └─ sheets_sink/
-│ ├─ sheets_sink.py
-│ └─ Dockerfile
-└─ db/
-├─ 00_warehouse.sql
-└─ 01_views.sql
-
-
----
+```text
+.
+├── docker-compose.yml        # whole stack; `standalone` profile swaps Airflow for loop containers
+├── .env.example              # copy to .env
+├── Makefile                  # `make help`
+├── apps/
+│   ├── producer/             # run_producer.py            API -> Kafka
+│   ├── spark_app/            # flight_stream.py (I/O) + transforms.py (pure, tested)
+│   ├── loader/               # load_warehouse.py          staging -> star schema
+│   └── sheets_sink/          # sheets_sink.py             view -> Google Sheets
+├── airflow/
+│   ├── Dockerfile
+│   └── dags/                 # warehouse_load_dag.py, sheets_sync_dag.py, _common.py (retry policy)
+├── db/
+│   ├── 00_warehouse.sql      # staging, dimensions, fact
+│   ├── 01_views.sql          # sync watermark table + curated view
+│   └── 02_create_airflow_db.sh
+├── tests/
+└── .github/workflows/ci.yml
+```
 
 ## Prerequisites
 
-- **Docker** + **Docker Compose**
-- **Aviationstack API key**
-- **Google Cloud Service Account (SA)** with **Google Sheets API** enabled  
-  - Download SA JSON key file
-  - Share your target Google Sheet with the SA **email address**
-- **Tableau Public** (desktop)
+- Docker with Compose v2
+- An [Aviationstack](https://aviationstack.com) API key (the free tier is plain HTTP only)
+- A Google Cloud **service account** with the Sheets API enabled. Download its JSON key to `~/gsa/gsa-keys.json` (or set `GSA_KEY_PATH`) and **share your target Google Sheet with the service account's email**
+- Tableau Public (desktop)
 
----
+## Quick start
 
-## Environment variables
+```bash
+make env                # creates .env from .env.example - now fill in the blanks
+make up                 # builds and starts everything, orchestrated by Airflow
+```
 
-Copy `.env.example` → `.env` and fill:
+- Airflow UI: <http://localhost:8080> (user/password from `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD`)
+- Follow a service: `make logs SERVICE=spark` · warehouse shell: `make psql` · list topics: `make topics`
+
+### Configuration (`.env`)
 
 | Key | Example | Notes |
 |---|---|---|
-| `AVIATIONSTACK_KEY` | `xxxxxxxx` | Aviationstack API key |
-| `KAFKA_TOPIC` | `flight_live` | Must match producer & spark |
-| `PGHOST` | `flight_postgres` | Docker DNS |
-| `PGPORT` | `5432` | Postgres port |
-| `PGDATABASE` | `flight_pipeline` | DB name |
-| `PGUSER` / `PGPASSWORD` | `flight_user` / `Password123` | Credentials |
-| `GSHEET_ID` | `1xWJ3yV1Q4...` | Sheet ID (middle of the URL) |
-| `GSHEET_TAB` | `flight_curated` | Tab written by sink |
-| `GSHEET_BATCH_SIZE` | `300` | Rows per append |
-| `GSHEET_INTERVAL_SEC` | `30` | Sleep when no rows |
-| `CHECKPOINT_DIR` | `/tmp/chk/flights_stream` | Spark checkpoints |
-| `HOST_KAFKA_PORT` | `9094` | Host Kafka port mapping |
+| `AVIATIONSTACK_KEY` | – | API key (required) |
+| `KAFKA_TOPIC` | `flight_live` | shared by producer and Spark |
+| `PGHOST` / `PGPORT` / `PGDATABASE` | `flight_postgres` / `5432` / `flight_pipeline` | Docker DNS name of the warehouse |
+| `PGUSER` / `PGPASSWORD` | `flight_user` / *your choice* | there is **no default password** in code |
+| `GSHEET_ID` / `GSHEET_TAB` | `1xWJ3y…` / `flight_curated` | spreadsheet ID (middle of the URL) and tab |
+| `GSHEET_BATCH_SIZE` | `300` | rows per append |
+| `GSA_KEY_PATH` | `~/gsa/gsa-keys.json` | host path of the service-account key |
+| `AIRFLOW_DB_PASSWORD`, `AIRFLOW_FERNET_KEY`, `AIRFLOW_SECRET_KEY`, `AIRFLOW_ADMIN_*` | – | see the generation one-liners in `.env.example` |
+| `CHECKPOINT_DIR`, `HOST_KAFKA_PORT` | `/tmp/chk/flights_stream`, `9094` | Spark checkpoints, host port mapping |
 
-> Place your SA key at: `${HOME}/gsa/gsa-keys.json` and **share the Sheet** with the SA email.
+### Two run modes (choose one)
 
----
+| Mode | Command | Loader / Sheets sync run as |
+|---|---|---|
+| **Airflow (default)** | `make up` | DAGs `warehouse_load` and `sheets_sync` |
+| **Standalone** | `make up-standalone` | plain loop containers `loader` and `sheets-sink` |
 
-## Run
+Never run both: they do the same work.
+
+## Reliability: where retries and idempotency live
+
+| Layer | Mechanism |
+|---|---|
+| Producer | Failed API calls (including Aviationstack's HTTP-200 error bodies) are retried with exponential backoff; Kafka sends use `acks=all`, `retries=5` |
+| Spark | Checkpointing; unparseable timestamps become `NULL` instead of failing the stream |
+| Airflow | Every task: 3 retries, exponential backoff (30 s → 5 min), 5-minute timeout, `max_active_runs=1`, `catchup=False` |
+| Loader | One server-side cutoff per run; upserts by natural key (`ON CONFLICT`); deletes only staging rows at or before the cutoff; connection retry with backoff |
+| Sheets sink | Watermark advances only after a successful append (at-least-once); a row updated by the loader is appended again |
+
+## Data model
+
+- **`fact_flight_status_staging`** – flat stream landing table written by Spark.
+- **Dimensions** – `dim_airline(airline_id, iata UNIQUE, icao, airline_name)`, `dim_airport(airport_id, iata UNIQUE, icao UNIQUE, airport_name)`, `dim_route(route_id, dep_airport_id, arr_airport_id)` with a unique departure/arrival pair.
+- **`fact_flight_status`** – latest snapshot per `flight_key` (primary key) with departure/arrival timelines, delays, `airline_id`, `route_id` and `last_updated`.
+- **`vw_flights_for_sheet_fact`** – denormalized view for Sheets/Tableau: `flight_key`, `flight_date`, `status`, `airline_iata`, `airline_name`, `dep_*` / `arr_*` timestamps and delays, `dep_iata`, `dep_icao`, `dep_airport`, `arr_iata`, `arr_icao`, `arr_airport`, `last_updated`.
+- **`gsheet_sync_state`** – one row holding the export watermark `(last_sync_time, last_flight_key)`.
+
+### Why the watermark has two columns
+
+The loader stamps a whole load cycle with one `NOW()`. A watermark on `last_updated` alone would skip the remainder of a cycle whenever it holds more rows than one batch. Ordering and comparing on `(last_updated, flight_key)` makes the position unambiguous; `tests/test_warehouse_integration.py` reproduces the failure and guards the fix.
+
+## Spark stream logic
+
+`apps/spark_app/transforms.py` holds the pure functions; `flight_stream.py` only wires Kafka in and JDBC out.
+
+- **`clean_ts()`** normalizes `Z` and `+0000` offsets, trims fractions to milliseconds, pads or adds missing seconds and assumes UTC when no offset is present. `TS_FMT` accepts an optional `.SSS` fraction.
+- **`parse_events()`** parses the JSON into typed, flattened columns.
+- **`filter_events()`** keeps rows with an accepted status, a `flight_key`, and a scheduled/actual time in the last N days (default 3).
+
+## Testing
 
 ```bash
-# Build and start everything
-docker compose up --build -d
+pip install -r requirements-dev.txt            # needs Java 17+ for PySpark
+make test                                      # unit tests (Postgres integration tests are skipped)
 
-# Tail logs (examples)
-docker compose logs -f producer
-docker compose logs -f spark
-docker compose logs -f loader
-docker compose logs -f sheets-sink\
+# include the integration tests: point at a DISPOSABLE Postgres (the schema files DROP tables)
+docker run -d --name pgtest -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:16
+TEST_PG_DSN="host=localhost port=5433 dbname=postgres user=postgres password=postgres" make test
+
+# DAG checks need Airflow (CI runs them in a separate job)
+pip install "apache-airflow==2.9.3" --constraint \
+  https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.11.txt
+pytest tests/test_dags.py
 ```
-# Verification Checklist
-
-### Spark
-- Prints schema and preview rows per micro-batch.
-
-### Postgres
-Check that data exists:
-```bash
-docker exec -it flight_postgres psql -U flight_user -d flight_pipeline -c \
-  "SELECT COUNT(*) FROM fact_flight_status_staging;"
-```
-
-## Google Sheets
-
-- Has header and new rows.
-- Delay columns (`dep_delay_min`, `arr_delay_min`) are in **numeric** format.
-
----
-
-## Data Model
-
-### Staging
-
-**fact_flight_status_staging** — Flat stream intake from Spark.
-
----
-
-### Dimensions
-
-| Table         | Columns                                      | Notes                    |
-|---------------|----------------------------------------------|--------------------------|
-| `dim_airline` | airline_id, iata (UNIQUE), icao, airline_name |                          |
-| `dim_airport` | airport_id, iata (UNIQUE), icao (UNIQUE), airport_name |                |
-| `dim_route`   | route_id, dep_airport_id, arr_airport_id     | Unique dep–arr pair      |
-
----
-
-## Fact Table
-
-### `fact_flight_status`
-Stores the latest flight data per flight key.
-
-- `flight_key` (Primary Key)
-- `status`
-- `dep_*` (e.g., scheduled, actual, delay, gate, terminal)
-- `arr_*` (e.g., scheduled, actual, delay, gate, terminal)
-- `last_updated`
-
----
-
-## Curated View (for Google Sheets & Tableau)
-
-### `vw_flights_for_sheet_fact`
-A view that joins the fact and dimension tables. Fields exposed:
-
-- `flight_key`
-- `flight_date`
-- `status`
-- **Airline**: `iata`, `airline_name`
-- **Departure**:
-  - timestamps: `dep_scheduled`, `dep_actual`, etc.
-  - delays: `dep_delay_min`
-  - codes: `dep_airport_iata`, `dep_airport_name`
-- **Arrival**:
-  - timestamps: `arr_scheduled`, `arr_actual`, etc.
-  - delays: `arr_delay_min`
-  - codes: `arr_airport_iata`, `arr_airport_name`
-- `last_updated`
-
----
-
-## Watermark Table
-
-### `gsheet_sync_state`
-Controls incremental pushes to Google Sheets.
-
-- `id = 1`
-- `last_sync_time` — Only rows with `last_updated > last_sync_time` are appended to Sheets.
-
----
-
-## Spark Stream Logic (Highlights)
-
-### Timestamp Cleaning — `clean_ts()`
-Standardizes inconsistent or malformed timestamp formats:
-- `'Z'` → `'+00:00'`
-- `+0000` → `+00:00`
-- Trim milliseconds to **3 digits**
-- Pad single-digit seconds (`...:2+00:00` → `...:02+00:00`)
-- Trim any 3-digit seconds
-- Append `+00:00` if timezone info is missing
-
----
-
-### Filtering & Write Logic
-
-- Keep only statuses:
-  - `active`, `landed`, `arrived`, `en-route`, `enroute`
-- Time filter:
-  - Only include flights within the **last 3 days**
-    - based on `dep_scheduled`, `dep_actual`, `arr_scheduled`, `arr_actual`
-- Skip empty micro-batches to avoid JDBC overhead
-- Write each valid micro-batch to **Postgres staging** via JDBC
-
----
-
-## Loader Logic
-
-- **Upserts** into dimension tables:
-  - `dim_airline`, `dim_airport`  
-  - IATA codes preferred; ICAO as fallback if IATA missing
-- **Builds routes** in `dim_route` using dep/arr airport references
-- **Upserts latest flight record** per `flight_key` into `fact_flight_status`
-  - Sets the `last_updated` timestamp for tracking freshness
-- **Deletes processed staging rows** up to the current micro-batch cutoff time
-
----
-
-## Sheets Sink (Google Sheets Writer)
-
-- Ensures header row is present, **bold**, **frozen**, and **auto-sized**
-- Formats `dep_delay_min` and `arr_delay_min` columns as **numeric**
-- Appends only rows where `last_updated > watermark` from `gsheet_sync_state`
-- **Updates the watermark** table after each successful sync
-
----
-
----
 
 ## Tableau Public
 
-### Connect Tableau to Google Sheets
+1. **Data → Google Sheets**, choose your sheet and the `flight_curated` tab (fed by `vw_flights_for_sheet_fact`).
+2. Starter calculations:
 
-1. Go to 
-    **Data → Google Sheets**
-2. Select your connected Sheet
-3. Choose the `flight_curated` tab (backed by `vw_flights_for_sheet_fact`)
-
----
-
-### Starter Calculations
-
-#### OnTime_Arrival_Flag
 ```tableau
+// OnTime_Arrival_Flag
 IF NOT ISNULL([arr_delay_min]) THEN
   IF [arr_delay_min] <= 5 THEN "On-time" ELSE "Late" END
 END
-```
 
-#### OnTime_Arrival_Flag_Count
-```tableau
+// OnTime_Arrival_Flag_Count  (use AVG over time for the on-time rate)
 IF NOT ISNULL([arr_delay_min]) THEN
-  IF [arr_delay_min] <= 5 THEN 1 ELSE 0
-  END
+  IF [arr_delay_min] <= 5 THEN 1 ELSE 0 END
 ELSE 0
 END
 ```
 
-#### Tip:
-Use AVG([OnTime_Arrival_Flag_Count]) over time to measure on-time performance trends.
+3. Suggested views: on-time trend by `flight_date` (line), average arrival delay by airline (bar), worst routes by delay (heatmap of `dep_iata → arr_iata`). Republish after **Data → Refresh**.
 
-## Example Visuals
+The sheet is an **append-only log of updates**: a flight appears again whenever the loader updates its row, so de-duplicate on `flight_key` by taking the latest `last_updated` in Tableau.
 
-| Visualization | Description |
-|----------------|--------------|
-| **On-time Trend by Flight Date (Line Chart)** | Plots average on-time rate over `flight_date`. |
-| **Average Arrival Delay by Airline (Bar Chart)** | Shows average `arr_delay_min` per airline, sorted descending. |
-| **Worst Routes by Delay (Heatmap)** | Uses a label like `dep_airport_code → arr_airport_code` to visualize route performance. |
-
-#### Refresh
-
-In authoring mode:
-Data → Refresh
-
-Republishing automatically updates Tableau Public.
-
-**Google Sheets-backed sources** auto-refresh whenever the Sheet updates.
-
-#### Tip
-
-You can combine the visuals above into an interactive Flight Performance Dashboard to showcase:
-
-Airline punctuality
-
-Route reliability
-
-Trends over time
-
-Perfect for portfolio or demo presentations.
-
----
-
----
 ## Operations
 
-### Rebuild After Code Edits
 ```bash
-docker compose build producer spark loader sheets-sink
-docker compose up -d
+make down          # stop, keep data          make reset   # stop AND delete volumes
+docker compose build producer spark && docker compose up -d      # after editing those apps
 ```
 
-### Quick DB Checks
-```SQL
+```sql
 SELECT COUNT(*) FROM fact_flight_status;
 SELECT * FROM vw_flights_for_sheet_fact ORDER BY last_updated DESC LIMIT 10;
 SELECT * FROM gsheet_sync_state;
 ```
----
-
-
----
 
 ## Troubleshooting
 
-| Issue                     | Check / Fix                                                                 |
-|---------------------------|------------------------------------------------------------------------------|
-| **Spark parse errors**    | Handled via `clean_ts()` — malformed values are safely cast to `NULL`       |
-| **No data in Postgres**   | Check:  
-  - Producer logs (API quota exceeded?)  
-  - Kafka topic name  
-  - Spark logs for schema or connection issues |
-| **Loader connection refused** | Postgres might still be starting. The loader retries with backoff logic |
-| **Sheets not updating**   | Ensure:  
-  - Sheet is **shared** with the Service Account email  
-  - `GSHEET_ID` and tab name are correct  
-  - `sheets-sink` logs show no quota or auth errors |
-| **Delays appear as text** | Sink enforces numeric format. If column formatting was manually changed, clear it and let the sink rewrite |
+| Symptom | Check |
+|---|---|
+| Nothing in staging | Producer logs (quota or key errors are printed); topic name matches in `.env`; Spark logs |
+| `dim_route` empty / `route_id` NULL | The producer must send `departure.iata` / `arrival.iata`; `SELECT dep_airport_iata FROM fact_flight_status_staging LIMIT 5` |
+| Airflow UI shows `warehouse_load` failing | Task log in the UI; the task retries 3 times before failing the run |
+| `database "airflow" does not exist` | You are reusing a Postgres volume created before Airflow was added: run `make airflow-db` (or `make reset` for a clean start) |
+| Sheets not updating | Sheet shared with the service-account email; `GSHEET_ID` / `GSHEET_TAB`; key exists at `GSA_KEY_PATH` (Docker creates an empty *directory* if the file is missing) |
+| Delays appear as text in Sheets | Clear the column format and let the `ensure_sheet` task reapply it |
 
----
+## Security & quotas
 
-## Security & Quotas
+- Never commit `.env` files or service-account keys; both are git-ignored. Rotate any key that was ever committed.
+- The Aviationstack free tier is rate-limited and HTTP-only: keep the producer interval conservative.
+- Google Sheets API quotas apply: tune `GSHEET_BATCH_SIZE` and the DAG schedule.
 
-- **Never commit `.env` files or Service Account (SA) keys** to GitHub or version control
-- **Aviationstack (free tier)**  
-  - API rate-limited → set a safe fetch interval in the producer
-- **Google Sheets API**  
-  - Write quota applies → tune `BATCH_SIZE` and `INTERVAL` in the sink
+## Ideas to extend
 
----
-
----
-
-## Ideas to Extend
-
-- **Add airport geolocation** data and build interactive **maps** in Tableau (e.g., flight paths, density plots)
-- **Materialize daily aggregates** (e.g., delay trends, airport-level stats) to accelerate BI dashboards
-- **Test PySpark logic** using `pytest` and [`chispa`](https://github.com/MrPowers/chispa) for transform validation
-
----
-
-## Resume Blurb
-
-> Built a Dockerized streaming pipeline with Kafka → PySpark → Postgres (star schema) and a Google Sheets → Tableau Public analytics layer.  
-> Implemented robust timestamp normalization, incremental sync to Sheets, and idempotent warehouse upserts.
-
----
+- Add airport geolocation and build map views in Tableau.
+- Materialize daily aggregates (delay trends, airport statistics) to speed up BI.
+- Add data-quality checks between staging and the fact table (row counts, null rates) as Airflow tasks.

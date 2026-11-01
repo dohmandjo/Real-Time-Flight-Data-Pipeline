@@ -1,0 +1,11 @@
+# Everything needed to run the unit + integration tests locally / in CI.
+# (The Airflow DAG tests need apache-airflow; see .github/workflows/ci.yml.)
+pytest>=8
+ruff>=0.6
+pyspark==3.5.6          # same minor version as the Spark image in docker-compose
+psycopg[binary]>=3.1,<4
+requests>=2.31,<3
+kafka-python>=2.0.2,<3
+python-dateutil>=2.9,<3
+google-api-python-client>=2.100,<3
+google-auth>=2.23,<3
